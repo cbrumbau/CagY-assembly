@@ -1,0 +1,76 @@
+Wed Jun 26 12:46:19 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all/	Modification of the nohot_all_good1 protocol in PacBio/
+to remove the use of SAM in building an HMM in order to generate a consensus
+sequence using another method to create a multiple sequence alignment (e.g. 
+blasr).
+
+Sat Jun 29 18:30:27 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_2/:	Modification of nohot_nohmm_all protocol to not use
+inserts during the sam_iter stage to see if stage 5 is still successful due
+to all-iter9.differences_from_real not aligning due to segements being too
+long.
+
+Mon Jul  1 13:48:31 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_2/:	Revised to be a modification of nohot_nohmm_all that
+uses only one insert during the second iteration to see if the issue with
+the final iteration being too long is due to the insert during iteration 6.
+
+Tue Jul  2 12:42:00 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_3/:	Modification of nohot_nohmm_all protocol with
+parameters to blasr adjusted to be more sensitive when aligning and
+introducing a quality threshold for the reads aligning to the reference,
+as well as only one insertion iteration during iteration 2.
+
+nohot_nohmm_all_4/:	Modification of nohot_nohmm_all protocol with the
+modifications of nohot_nohmm_all_3 and changes from using the training
+reads set to the alignment reads set when building the multiple
+sequence alignment used to build the new consensus sequence each iteration.
+
+Deleted nohot_nohmm_all_2/ nohot_nohmm_all_3/ and nohot_nohmm_all_4/
+
+Cleaned out results in nohot_nohmm_all and will rerun the revised
+Makefile to include training and final alignment steps.
+
+Wed Jul 10 17:53:50 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_2:	Modification of nohot_nohmm_all protocol to remove
+the use of blastn and condensing the protocol to one initial blasr with all
+subsequent blasr calls for training and generation of the consensus sequence
+done within one script training-and-consensus-from-sam.
+
+Mon Jul 22 17:08:13 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_3:	Modification of nohot_nohmm_all_2 protocol to use
+a different read selection (similar to nohot_nohmm_all) in order to see if
+the issue with nohot_nohmm_all_2 lies with the read selection (as opposed
+to the blasr alignment or the model surgery logic).
+
+Tue Jul 23 11:01:01 PDT 2013 Chris Brumbaugh
+
+nohot_nohmm_all_2_1:	Modification of parameters in nohot_nohmm_all_2 to
+run simulataneously with that directory to save time trying to find the
+optimal parameters to reduce the number of errors in the final consensus
+sequence. Match and indel prob set to 0.8.
+
+nohot_nohmm_all_2_2:	Modification of parameters in nohot_nohmm_all_2 to
+run simulataneously with that directory to save time trying to find the
+optimal parameters to reduce the number of errors in the final consensus
+sequence. Match and indel prob set to 0.75.
+
+Thu Jul 25 13:44:16 PDT 2013 Chris Brumbaugh
+
+Deleted nohot_nohmm_all_2_1/ and nohot_nohmm_all_2_2/
+
+Fri Aug  2 14:34:19 PDT 2013 Chris Brumbaugh
+
+Deleted nohot_nohmm_all_3/
+
+Fri Oct 18 14:03:18 PDT 2013 Chris Brumbaugh
+
+nohot_hmm_all:	Modification of nohot_nohmm_all_2 to use nhmmer to
+use nhmmer instead of blastn and blasr.
+

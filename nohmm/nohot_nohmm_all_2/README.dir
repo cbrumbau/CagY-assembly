@@ -1,0 +1,44 @@
+Wed Jul 24 13:19:17 PDT 2013 Chris Brumbaugh
+
+old.3/:		Run with 5x number of train and align reads without RLE v1.
+
+old.4/:		Run with 5x number of train and align reads with RLE v1.
+
+old.5/:		Run with 1x number of train and align reads with RLE v1.
+
+old.6/:		Run with 1x number of train and align reads with RLE v1 and match and
+indel prob set to 0.6.
+
+old.7/:		Run with 1x number of train and align reads with RLE v1 and match and
+indel prob set to 0.7.
+
+Thu Jul 25 13:46:48 PDT 2013 Chris Brumbaugh
+
+old.8/:		Run with 1x number of train and align reads with match and indel prob
+set to 0.6.
+
+Tue Jul 30 12:49:11 PDT 2013 Chris Brumbaugh
+
+old.9/:		Run with 1x number of oriented train and align reads with match and
+indel prob set to 0.6 with RLE v2.
+
+Wed Jul 31 11:11:13 PDT 2013 Chris Brumbaugh
+
+old.10/:	Run with 1x number of oriented train and align reads with match and
+indel prob set to 0.6 with RLE v2 and new extends option.
+
+old.11/:	Run with 1x number of oriented train and align reads with match and
+indel prob set to 0.6 with RLE v2 and new extends option (modified).
+
+Fri Aug  9 11:28:07 PDT 2013 Chris Brumbaugh
+
+old.12/:	Run with 1x number of oriented train and align reads with match and
+indel prob set to 0.5 with RLE v2 and new extends option v2 and rounding set to
+ceiling.
+
+Fri Aug 23 14:53:20 PDT 2013 Chris Brumbaugh
+
+old.13/:	Run with 1x number of oriented train and align reads with match and
+indel prob set to 0.5 with RLE v2 and new extends option v2 and read selection for
+train and align changed from blasr score to scoring function used in stage 4.
+

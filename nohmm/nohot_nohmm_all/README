@@ -1,0 +1,424 @@
+-- Retroactively added, from memory, chat logs, and e-mails sent --
+
+Thurs Jun 06 2013 Chris Brumbaugh
+
+Working to modify nohot_all_good1 Makefile from using SAM HMM models to using blasr and resulting .sam multiple alignment
+for iteration and model surgery since HMM models take too long to generate for what is needed here. Will be comparing
+results to original Makefile results to see (relatively) how well this new method works.
+
+Fri Jun 07 2013 Chris Brumbaugh
+
+Replaced HMM_ITER with blasr to generate multiple alignment.
+
+Used previous traning data as reads to blasr and iter0 as the reference to output the multiple sequence alignment to
+a .sam file.
+
+Next, used samtools mpileup and generate a variant calls format based on the .sam alignment that blasr created.
+
+Finally used GATK from the Broad Institute to apply the .vcf to the previous iteration as model surgery to apply
+changes.
+
+There is an issue generating the filtered .vcf from the raw .vcf derived from the samtools mpileup. Maybe a problem
+with the samtools Perl script used to filter the .vcf file?
+
+Sat Jun 08 2013 Chris Brumbaugh
+
+Held Skype call with Kevin. Kevin suggested two papers to read related to the run length encoding that has been considered
+as the implementation to try instead of the temporary use of blasr.
+
+Told Kevin about the issue with samtools mpileup not working properly, maybe due to the samtools Perl script. Suggested to
+try to do my own filtering if I cannot get the Perl script filtering working.
+
+Mon Jun 10 2013 Chris Brumbaugh
+
+Figured out why the pileup step was failing. bcftools requires a '-' as the input file to actually read from STDIN.
+
+GATK does not like fasta files with spaces in them (not recognized IUPAC character for fasta file format). Used sed
+to edit reference file in place to be removed of spaces. (Why are there spaces in the fasta files in the first
+place...?)
+
+Downloaded and installed/placed Picard in /projects/compbio as the dictionary generation is required for GATK to
+work. Added dictionary generation to Makefile.
+
+Should run to completion now (hopefully).
+
+Tues Jun 11 2013 Chris Brumbaugh
+
+Looks like the Makefile failed to progress past the first iteration. Looking into why it failed (presumably issue
+with GATK?).
+
+It appears that GATK in the alternate fasta file it produces with the .vcf file has the header replaced, so the
+selection for training that occurs on subsequent iteration has no information in the header line to know what to
+select for. Carried over the header from the previous iteration, changing iter0 (previous) to iter1 (current) with
+sed, escaping all the regex characters present in the header line (forward slash) for the sed statement to replace
+the GATK header line (">1") with the approrpriate header information.
+
+Metric in STAGE 4 fails as it is expecting information from the HMM models from the previous step. Will need to
+replace with something more appropriate, as HMM use has been replaced.
+
+Wed Jun 12 2013 Chris Brumbaugh
+
+Read how SAM's HMM NNL score is used as a metric to compare and see if the sequence was generated from that given
+model (negative natural log of the probability that a given sequence was generated from the HMM model).
+
+In the Makefile, it appears that the 10th ranked NNL score was (arbirarily?) used to determine which consensus
+sequence generated from the seeds will be used to represent a given merged region.
+
+After examining the variant calls format more closely, it looks like there are some form of quality scoring
+associated with the modifications represented in the file. Could be useful?
+
+Maybe should look into how many reads map vs unmapped (all reads? training reads?) to the consensus sequences.
+
+Considering using something combining both of the ideas mentioned above? Sent Kevin an email about it.
+
+Will try using the combined reads pool from the training sequences to select the best consensus sequence to move
+forward with.
+
+Thurs Jun 13 2013 Chris Brumbaugh
+
+Starting to rewrite STAGE 4 to something more appropriate.
+
+Looks like concatenating gzip files together produces a valid gzip file. Going to merge all PacBio reads from the
+last iteration and use as the combined reads pool.
+
+Installed fastx toolkit in order to use fastx_collapser in order to remove any duplicate reads present in the
+combined reads pool.
+
+fastx_collapser doesn't like the input from the merged set of reads; it recommends using fasta_formatter to format
+the data being input to fastx_collapser. After changing this, fastx_collapser now works. It looks like only the
+header information is lost with the fasta_formatter, but that information isn't necessary as this combined pool of
+reads will only be used here.
+
+After reading and poking around, it looks like CollectAlignmentSummaryMetric.jar from Picard should have what I would
+like to use to select the best consensus sequence (PF_ERROR_RATE).
+
+Used blasr to use the combined pool of reads against each consensus sequence to generate a .sam alignment, then used
+samtools to generate a sorted .bam file as input for Picard. The output of CollectAlignmentSummaryMetric.jar seems
+like a simple enough text file to parse and get the error rate to sort on.
+
+Able to extract and sort on the error rate, so hopefully this modification should work.
+
+All of the error rates produced are 0 - not sure if this is an issue with something I did earlier, or a
+misunderstanding with what the PF_ERROR_RATE produced is.
+
+Fri Jun 14 2013 Chris Brumbaugh
+
+Decided to abandon the use of Picard to generate the summary metric, will generate a metric on my own with a Python
+script.
+
+Not decided if whether using some sort of crude score (e.g. total aligned - (substitutions + insertions + deletions +
+etc)) or some other form of weighted metric (e.g. percentage, or something else).
+
+Wrote up script with some sort of percentage, using the substitutions, insertions, deletions, soft clip, and hard
+clip from the .sam CIGAR string divided by the total bases aligned as the metric to use. Still playing with script in
+~cbrumbau/tmp to make sure it works first.
+
+Looks like I tried to build and install pysam, but it didn't work. The pysam install with the setup script doesn't
+work because it doesn't view the directory I am trying to install it to (/projects/combio/lib/python2.7) as a valid
+library location used by Python 2.7. Will resolve this issue later.
+
+Old code using Picard was removed/modified in the Makefile, so here it is for reference:
+
+<CODE>
+
+# Align the merged pool for each consensus sequence using blasr
+# Then get .sam alignment summary statistics with Picard
+# blasr only likes .fasta file extension, do something about that
+%-iter${ITER}.stats: ${REGION_AB}-iter${ITER}_merged_pool.fasta %-iter${ITER}.fna
+	mv $*-iter${ITER}.fna $*-iter${ITER}.fasta
+	blasr $< $*-iter${ITER}.fasta \
+	    -nproc 4 \
+	    -sam \
+	    -out $*-iter${ITER}_select_seed.sam
+	mv $*-iter${ITER}.fasta $*-iter${ITER}.fna
+	samtools view -b $*-iter${ITER}_select_seed.sam \
+	| samtools sort $*-iter${ITER}_select_seed.sorted
+	java -jar ${PICARD}/AlignmentSummaryMetrics.jar \
+	    ADAPTER_SEQUENCE= null \
+	    INPUT= $*-iter${ITER}_select_seed.sorted.bam \
+
+# Select the top scoring consensus sequence, looking for lowest alignment error rate with Picard
+${REGION_AB}-iter${ITER}.selected-fna: ${SELECT_STATS}
+	cat $^ \
+	| grep -E '(OUTPUT|^\w)' \
+	| awk '{if ($$1 == "#") {printf $$5"\t"} else if ($$1 != "CATEGORY") {print $$14}}' \
+	| sort -n -k 2 \
+	| head -1 \
+	| awk '{print $1}' \
+	| sed -e 's/OUTPUT=//' \
+	| sed -e 's/.stats/.fna/'
+	> $@
+
+</CODE>
+
+Mon Jun 17 2013 Chris Brumbaugh
+
+Was able to install pysam using the bash shell (over using default cshell) to set the environmental variable required
+to identify additional Python library paths.
+
+pysam still can't be used in Python. Looks like there were issues with the directory structure regarding how the
+library was installed. Instead of the structure seen in Cython/Pyrex (module.egg-info with subdirectory e.g. cython/
+or pyrex/) pysam installed with a different structure (module.egg/ directory with EGG-INFO/ and pysam/ subdir).
+Adjusting pysam to have the same structure as the other modules (moving module.egg/EGG-INFO/PKG-INFO to
+module.egg-info on the top directory and moving pysam up a directory) allowed it to be properly seen my Python 2.7.
+Perhaps a newer version of the setup script for 3.x was used? That wouldn't entirely make sense as pysam hasn't been
+rewritten for 3.x yet, though.
+
+Decided to go with a crude weighted score to determine which consensus sequence to choose. The score is calculated as
+follows:
+
+weighted score = bases aligned - (substitution weight * substitutions + insertion weight * insertions + deletion
+weight * deletions + soft clip + hard clip + unmapped bases)
+
+Sent Kevin an email with news that STAGE 4 has been modified and completed. Looks like the Makefile is running
+smoothly in region2_3 now.
+
+Tues Jun 18 2013 Chris Brumbaugh
+
+Problems with STAGE 5 have appeared. After looking into the issue with the Python debugger (python2.7 -m pdb), it
+seems that the merged regions (region1_2 and region2_3) can't be matched up to each other with blat. The call in
+merge-sequences-with-blat using region2 as a guide region to where_longest_common seems to be returning None because
+there was no max_dict present. It seems that blat is running correctly, but there are no results to report when
+looking for an overlapping subsequence. Sent Kevin an email regarding this issue.
+
+Re-reading the papers Kevin sent me on my tablet while waiting for a response. Not sure if this issue in STAGE 5
+means there is an error in my use of GATK to do the model surgery in the iteration stage, or an issue with the merged
+pool I am using to select the best consensus sequence to use to represent the merged region in STAGE 4.
+
+-- Retroactive addition end ---
+
+Wed Jun 19 13:26:40 PDT 2013 Chris Brumbaugh
+
+Finished writing up retroactive addtion to this README file. Sending Kevin an email about this.
+
+Plan to try merge-sequences-with-blat without a guide to see the results. Leaning towards thinking the issue lies
+with using GATK to perform the model surgery; however, with the samtools pileup format deprecated and samtools
+mpileup only generating .vcf/.bcf output, I am trying to consider a simple method to use in order to do the model
+surgery.
+
+Thu Jun 20 12:55:39 PDT 2013 Chris Brumbaugh
+
+Held Skype meeting with Kevin. Discussed that the reason STAGE 5 was failing to find a subsequence between the merged
+regions is due to the fact that when iterating model surgery on the consensus sequence it is slowly losing length.
+Suggested looking at the consensus-from-a2m script with the "--insert be" option and modifying it to work with .sam
+alignments in order to resolve the issue. Might need to rework the SAM_ITER stage to no longer need samtools
+mpileup and Picard/GATK if going to generate the consensus sequence from the .sam file.
+
+Also discussed some possible ideas regarding the implementation of using this protocol (when complete) on the 10 strains
+data set. The problem will be changing from selecting one consensus sequence representative of a merged region to
+multiple consensus sequences, so I'll need a way to strip out poorly supported consensus sequences (likely due to
+erroneous reads, or an actual strain that's just underrepresented in the data) and some way to rank and select the
+consensus sequences to proceed with. Mmerging similar consensus sequences could also be a possible option. Also, it
+would be worth noting that looking into whether penalizing for soft clip and hard clip are necessary for the
+weighted score and not to count unmapped reads against the consensus sequences when working with the multiple strain
+data.
+
+Moved personal builds of libraries and utilities (e.g. blat, fastx_toolkit, pysam, samtools) to
+/projects/compbio/programs and ran fixmode on them. Added README.ucsc to specify problems encountered when installing
+them and how to work around it.
+
+Fri Jun 21 14:01:45 PDT 2013
+
+Looked at consensus-from-a2m script to implement a version that will work with .sam alignment format.
+
+Rough idea is as follows:
+
+<PSEUDOCODE>
+
+read in alignments one at a time:
+	parse CIGAR list for matches
+	generate dict of positions with dict of matches and counts, use position offset
+	parse CIGAR list for inserts
+	keep track of longest insert before given position
+		generate dict of positions with longest insert seen in that position?
+		how to do this given alignments in .sam format? need to consider offset?
+		note: .a2m format uses - as padding to align the alignment to the reference
+		note: .a2m uses lowercase for insert, uppercase for match
+
+apply the 'b' and 'e' settings as done in consensus-from-a2m
+
+don't implement random begin end for now
+
+create consensus sequence, going through reference sequence positions and comparing to match dict
+
+</PSEUDOCODE>
+
+Working on implementing this in a new Python script.
+
+Still fixing up the portion that parses information out of the .sam alignment using pysam.
+
+Mon Jun 24 13:08:28 PDT 2013 Chris Brumbaugh
+
+Apparently my account has been moved over to an alumni account, and I have lost access to the Python script I was working on.
+
+Submitted a ticket to IT, sent email to Kevin, should be resolved eventually (hopefully sooner rather than later).
+
+Resolved with help of Eric Shell (eshell@soe.ucsc.edu). Resumed work on consensus-from-sam.
+
+Tue Jun 25 10:03:36 PDT 2013 Chris Brumbaugh
+
+Python 2.7 cannot be found any longer. When attempting to access it:
+
+> /usr/bin/env python2.7
+/usr/bin/env: python2.7: No such file or directory
+
+Not sure yet if this has to do with the move to the alumni group or some other recent change with the system.
+
+Looks like on some of the SOE compute servers the file handle for /projects/linuxSW was screwed up due to the file
+system upgrade this morning; an IT ticket was submitted regarding the issue. A couple of the servers have the file
+mount working properly, so I have moved over to one of those to continue my work.
+
+The .sam file parsing and extraction for alignment matches and insertions seems to be working fine now, moving on to
+preparing the inserts that need to be added and condensing the matches into the new consensus sequence.
+
+Added logic to build longest_insert_before dict from the longest_insert dict.
+
+Wed Jun 26 18:07:35 PDT 2013 Chris Brumbaugh
+
+Held meeting with Skype today over Kevin. Discussed implementation of consensus-from-a2m and what features I
+should reimplement in consensus-from-sam. The random additions are not necessary and were left in from a
+first attemp that did not work as anticipated. Resturctured some of the code in consensus-from-sam to be
+more similar to consensus-from-a2m in order to apply some code reuse.
+
+Continued to work on consensus-from-sam and it is about ready to be integrated into the nohmm Makefile.
+
+Thu Jun 27 14:01:31 PDT 2013 Chris Brumbaugh
+
+Completed consensus-to-sam and tested it; it hopefully shouldn't have any major bugs at this point.
+
+Revising Makefile to use consensus-from-sam, old code is here for reference:
+
+<CODE>
+
+HEADER := $(shell grep ">" ${SEED_NAME}-iter${PREV_ITER}.fna | sed -e 's/iter${PREV_ITER}/iter${ITER}/' | sed -e 's/\//\\\//g')
+
+sam_iter:	Pac_reads_in_${SEED_NAME}-iter${PREV_ITER}.blastn.gz \
+		${SEED_NAME}-selection-for-train-iter${ITER} \
+		${SEED_NAME}-selection-for-train-iter${ITER}-begin \
+		${SEED_NAME}-selection-for-train-iter${ITER}-end \
+		${SEED_NAME}-oriented_train-iter${ITER}.fasta.gz \
+		${SEED_NAME}-iter${ITER}.sam \
+		${SEED_NAME}-iter${ITER}.bam \
+		${SEED_NAME}-iter${ITER}.sorted.bam \
+		${SEED_NAME}-iter${ITER}.flt.vcf \
+		${SEED_NAME}-iter${ITER}.fna \
+		${SEED_NAME}-sam_iter.DONE
+
+# ...
+
+# Sort BAM file
+%-iter${ITER}.sorted.bam: %-iter${ITER}.bam
+	samtools sort \
+	    $< \
+	    $*-iter${ITER}.sorted
+
+# Generate pileup using previous iter for reference to SAM alignment
+%-iter${ITER}.flt.vcf: %-iter${ITER}.sorted.bam %-iter${PREV_ITER}.fna
+	samtools faidx $*-iter${PREV_ITER}.fna
+	samtools mpileup -uf $*-iter${PREV_ITER}.fna $< \
+	| bcftools view -cg - \
+	| /projects/compbio/bin/scripts/vcfutils.pl varFilter -D100 \
+	> $@
+
+# Apply filtered vcf to previous iteration to generate current consensus sequence
+# Use GATK from the Broad, insert path to jar
+# GATK only likes .fasta or .fa file extension, do something about that
+# GATK doesn't like spaces in fasta files
+# Generate necessary dict file for reference with Picard
+# Fix improper header output from GATK
+%-iter${ITER}.fna: %-iter${ITER}.flt.vcf %-iter${PREV_ITER}.fna
+	sed -e '/>/n;s/ //g' $*-iter${PREV_ITER}.fna > $*-iter${PREV_ITER}.fasta
+	samtools faidx $*-iter${PREV_ITER}.fasta
+	java -jar ${PICARD}/CreateSequenceDictionary.jar \
+	    R= $*-iter${PREV_ITER}.fasta \
+	    O= $*-iter${PREV_ITER}.dict
+	java -Xmx2g -jar ${GATK}/GenomeAnalysisTK.jar \
+	    -R $*-iter${PREV_ITER}.fasta \
+	    -T FastaAlternateReferenceMaker \
+	    -o $@ \
+	    --variant $<
+	sed -i -e 's/>1/${HEADER}/' $@
+
+.PRECIOUS:	\
+		%-selection-for-train-iter${ITER} \
+		%-selection-for-train-iter${ITER}-begin \
+		%-selection-for-train-iter${ITER}-end \
+		%-oriented_train-iter${ITER}.fasta.gz \
+		%-iter${ITER}.sam \
+		%-iter${ITER}.sorted.bam \
+		%-iter${ITER}.flt.vcf \
+
+</CODE>
+
+Apparently when using a .bam with pysam, it wants the .bam file to be sorted and indexed. Added steps to do this to
+the Makefile.
+
+Fri Jun 28 12:40:05 PDT 2013 Chris Brumbaugh
+
+There was an error in consensus-from-sam, where separate indices for the reference and for the alignment were not
+properly kept. A reference index was added, and now the Makefile runs smoothly.
+
+Looking into either replacing the initial blastall to filter out good reads for training with blasr or increasing the
+number of processor cores blastall uses to near max number for the system it is running on. That should net some sort
+of a speed increase, but it appears that most of the time is the actual subsequent filtering and selecting of
+training reads before a multiple alignment is produced using blasr.
+
+Mon Jul  1 12:08:06 PDT 2013 Chris Brumbaugh
+
+Added multiple core support to the Makefile, now blastall and blasr will use multiple cores depending on the machine
+it is running on.
+
+Finished adjusting the insertion steps to try and counteract the final consensus sequence being too long compared to
+the real sequence. The resulting consensus sequence was shorted, but still was too long for the alignment when
+comparing to the real sequence.
+
+Tue Jul  2 12:45:13 PDT 2013 Chris Brumbaugh
+
+Adjusted the blasr options to be more sensitive when aligning the training reads and now using a percentage idenity
+threshold on the reads when aligned to the reference. Trying this change in ../nohot_nohmm_all_3.
+
+Changed the reads used in the iteration stage into the alignment reads (a lot more reads than the training set).
+Trying this change in ../nohot_nohmm_all_4.
+
+Will be removing all these directories and condensing to one directory after the results from all of the runs are
+compared to each other.
+
+Fri Jul  5 14:06:34 PDT 2013 Chris Brumbaugh
+
+Forgot to add enties as I was too busy working on getting training-from-sam and the Makefile working.
+
+Talked with Kevin on Wednesday about what to do for planning and what to expect when modifying the new protocol to
+work on data containing 10 strains as opposed to a single strain. Will plan on adding choosing which reads to apply
+to a consensus sequence before attempting an alignment, looking into mixture models and how to train mixtures, and
+considering what to do to replace stage 5, as region 2 is not a variable region and should be common to all strains,
+so it can't be used as a guide to merge region1_2 and region2_3.
+
+Additionally, direction-from-blast isn't required as blasr (and the future replacement I will write to deal with
+homopolymers) do not need all the reads in the same direction as working with HMMs in SAM did.
+
+training-from-sam is complete, and the new training appears to proceed well, but currently there is an issue
+proceeding from the trained consensus sequence to the alignment to generate the final consensus sequence for that
+pass. It appears that this issue is occuring in the direction-from-blast in the orientation target for the alignment
+reads, so it may be caused at this part or possibly with the dependencies required for this target. As far as I can
+tell, the input appears to be fine, so it may be an issue with direction-from-blast. Replacing and/or modifying this
+script might have to be done sooner than expected.
+
+Wed Jul 10 17:56:41 PDT 2013 Chris Brumbaugh
+
+Run with corrected protocol finished on Monday, taking a bit over 24 hours. Discussed results with Kevin on Tuesday.
+
+Although the results are mostly correct now with the added training iteration step, there are issues with the bases at
+the ends of the consensus sequence. This could potentially due to the alignment algorithm used in blasr, or an issue
+with too few end training reads (as using too many would have made running SAM to generate HMMs too slow).
+
+In order to try and speed up the protocol (where most of the time is spent using blastn and orienting the reads), 
+replacement of these portions with a single blasr against all reads and then the training and generation of the 
+consensus sequence would be handled by a single script taking the reads that aligned to the inital blasr.
+
+Regarding the issue with the ends, first it should be determined if it is a read issue or an alignment issue with blasr. 
+This can be determined by using blasr to align all the reads against the "real" sequence and looking at the resulting 
+multiple alignment. If it is indeed an issue with blasr using local alignments, then the ends can be "enhanced" by
+looking for reads that align at the beginning and ends, and using the optional user fields added to the final 
+alignment by blasr to see if there is more of the read before (at the beginning) or after (at the end) and incorporate 
+this into the consensus sequence for the extensions.
+
