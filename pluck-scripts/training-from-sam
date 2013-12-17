@@ -1,0 +1,194 @@
+#!/usr/bin/env python2.7
+"""
+training-from-sam
+
+Trains a consensus sequence given a .sam or .bam alignment and the reference sequence.
+Continues until it converges or hits iteration hard limit.
+
+Chris Brumbaugh, cbrumbau@soe.ucsc.edu, 07/02/2013
+"""
+
+import sys, argparse, itertools, os, random, subprocess
+from Bio import SeqIO
+sys.path.append('/projects/compbio/lib/python2.7/site-packages')
+import pysam
+
+import fasta
+
+# Command line arguments: training reads file, reference fasta file, convergence limit
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--reads", required=True,
+	help="""The training reads to be used to train the
+consensus sequence as a gzipped file.""")
+parser.add_argument("--reference", required=True,
+	help="""The reference fasta file for the provided alignment.""")
+parser.add_argument("--limit", type=int, default=9,
+	help="""The number of iterations to stop at if the training
+does not converge on a consensus sequence.""")
+parser.add_argument("--parallel", type=int, default=1,
+	help="""The number of processors to use when using
+blasr to generate the multiple sequence alignments.""")
+parser.add_argument("--min_prob", type=float,
+	help="""Discard match columns where the most probable base
+has a probability less than this.""")
+parser.add_argument("--min_coverage", type=int,
+	help="""Discard match columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--min_prob_ins", type=float,
+	help="""Discard insert columns where the most probable base
+has a probability less than this.""")
+parser.add_argument("--min_coverage_ins", type=int,
+	help="""Discard insert columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--name", default=None,
+	help="""Name for the new consensus sequence. Default is the
+fasta description for the reference sequence.""")
+
+args = parser.parse_args()
+
+# Set filehandle for alignment appropriately
+reference_fasta = SeqIO.read(open(args.reference, 'r'), 'fasta')
+
+if args.name is None:
+	# Set name (by default) to reference description
+	args.name = reference.description
+
+def apply_match_and_delete(match_dict, ref_base, delete_dict, min_coverage=0, min_prob=0.0):
+	# Apply delete is above min_prob
+	if delete_dict["nodelete"] != 0:
+		if (float(delete_dict["delete"]) / float(delete_dict["delete"] + delete_dict["nodelete"])) > min_prob:
+			return ""
+	# Check if match_dict is empty
+	if match_dict == {}:
+		return ref_base
+	# Check for min coverage
+	if sum(match_dict.values()) < min_coverage:
+		return ref_base
+	# Check for min prob
+	if (float(max(match_dict.values())) / float(sum(match_dict.values()))) < min_prob:
+		return ref_base
+	# Apply best alignment match
+	max_count = max(match_dict.values())
+	match_bases = []
+	for (base, count) in match_dict.iteritems():
+		if count == max_count:
+			match_bases.append(base)
+	# Return one of the best match(es)
+	if len(match_bases) == 1:
+		# Only one best match, return base
+		return match_bases[0]
+	else:
+		# Select one of best match bases at random
+		random.seed()
+		return match_bases[random.randint(0, len(match_bases)-1)]
+
+def apply_insert(insert_dict, min_coverage=0, min_prob=0.0):
+	# Check if insert dict has inserts
+	if (len(insert_dict["insert"]) + insert_dict["noinsert"]) == 0:
+		return ""
+	# Check for min coverage
+	if len(insert_dict["insert"]) < min_coverage:
+		return ""
+	# Check for min prob of insert
+	if (float(len(insert_dict["insert"])) / float(insert_dict["noinsert"])) < min_prob:
+		return ""
+	# Check for min prob of best insert
+	freq = dict()
+	for insert in insert_dict["insert"]:
+		try:
+			freq[insert[0]] += 1
+		except:
+			freq[insert[0]] = 1
+	(base, max) = sorted([(key, value) for (key, value) in freq.iteritems()], key=lambda ins: ins[1], reverse=True)[0]
+	total = sum([value for value in freq.itervalues()])
+	if (float(max) / float(total)) < min_prob:
+		return ""
+	# Apply best insert
+	return base
+
+subprocess.call(["gunzip", args.reads])
+reference = str(reference_fasta.seq)
+previous_consensus = list()
+
+# Iterate training consensus sequence until convergence or limit
+for iter in range(0, args.limit):
+	# Generate .sam alignment using blasr
+	consensus_file = open(args.reference + ".tmp.fasta", "w")
+	consensus_file.write(">iter" + str(iter) + "\n" + reference)
+	consensus_file.close()
+	subprocess.call(["/projects/compbio/bin/x86_64/blasr", os.path.splitext(args.reads)[0], args.reference + ".tmp.fasta", "-nproc", str(args.parallel), "-sam", "-out", args.reference + ".tmp.sam"])
+	# Open .sam and prepare to parse
+	sam_file = pysam.Samfile(args.reference + ".tmp.sam", 'r') 
+	match_count = [{} for i in range(len(reference))] # list of dicts containing match counts
+	insert_count = [{"insert": list(), "noinsert": 0} for i in range(len(reference))] # list of dicts containing insert counts
+	delete_count = [{"delete": 0, "nodelete": 0} for i in range(len(reference))] # list of dicts containing deletion counts
+	# Read in alignment file and store alignment matches
+	for align in sam_file.fetch():
+		# Parse the CIGAR string
+		cigar_pos = 0	
+		ref_pos = 0
+		for (cigar_op, cigar_len) in align.cigar:
+			# Add matches to dict, using offset in position (0 based in pysam, 1 based in CIGAR format)
+			if cigar_op == 0: # alignment match
+				# Process all matches for length indicated by CIGAR
+				for match_pos in range(0, cigar_len):
+					current_pos = align.pos + ref_pos + match_pos
+					# Get the actual alignment match from the sequence
+					align_match = align.seq[cigar_pos + match_pos]
+					try:
+						# Increment current match counter
+						match_count[current_pos][align_match] += 1
+					except:
+						# Add new match to current dict
+						match_count[current_pos][align_match] = 1
+					insert_count[current_pos]["noinsert"] += 1
+					delete_count[current_pos]["nodelete"] += 1
+				ref_pos += cigar_len
+				# align match + insertion + soft clip + seq match + seq mismatch = seq length
+				cigar_pos += cigar_len
+			elif cigar_op == 1: # insertion
+				insert_match = align.seq[cigar_pos:(cigar_pos + cigar_len)]
+				current_pos = align.pos + ref_pos
+				insert_count[current_pos]["insert"].append(insert_match)
+				# align match + insertion + soft clip + seq match + seq mismatch = seq length
+				cigar_pos += cigar_len
+			elif cigar_op == 2: # deletion
+				for del_pos in range(0, cigar_len):
+					current_pos = align.pos + ref_pos + del_pos
+					delete_count[current_pos]["delete"] += 1
+				ref_pos += cigar_len
+			elif cigar_op in [3, 6]: # [skipped region, padding (silent deletion)]
+				ref_pos += cigar_len
+			elif cigar_op in [4, 7, 8]: # [soft clip, seq match, seq mismatch]
+				for op_pos in range(0, cigar_len):
+					current_pos = align.pos + ref_pos + op_pos
+					insert_count[current_pos]["noinsert"] += 1
+					delete_count[current_pos]["nodelete"] += 1
+				ref_pos += cigar_len
+				# align match + insertion + soft clip + seq match + seq mismatch = seq length
+				cigar_pos += cigar_len
+	# Generate consensus sequence from data
+	consensus_list = [apply_match_and_delete(match_dict, reference[index], delete_count[index], min_coverage=args.min_coverage, min_prob=args.min_prob) for (index, match_dict) in enumerate(match_count)]
+	insert_list = [apply_insert(insert_dict, min_coverage=args.min_coverage_ins, min_prob=args.min_prob_ins) for (index, insert_dict) in enumerate(insert_count)]
+	training_consensus = "".join([item for items in itertools.izip_longest(insert_list, consensus_list, fillvalue="") for item in items])
+	# Compare to previous consensus sequence to check for converegence
+	# Add later
+	#if len(previous_consensus) > 0:
+	# Prepare for next iteration by setting previous_consensus and reference
+	#previous_consensus.append(training_consensus)
+	reference = training_consensus
+
+# Clean up temporary files
+#tmp_files = [args.reference + ".tmp.fasta", args.reference + ".tmp.sam", args.reference + ".tmp.bam", args.reference + ".tmp.sorted.bam", args.reference + ".tmp.sorted.bai"]
+tmp_files = [args.reference + ".tmp.fasta", args.reference + ".tmp.sam"]
+for file in tmp_files:
+	os.remove(file)
+
+# Gzip reads file
+subprocess.call(["gzip", "-9", os.path.splitext(args.reads)[0]]) 
+
+# Print trained consensus sequence as fasta to STDOUT
+fasta.print_sequence(sys.stdout, args.name, "", training_consensus, line_len=100, block_len=100)
+
+sys.exit(0)

@@ -1,0 +1,73 @@
+#!/usr/bin/env python2.7
+"""
+errorscore_sam_alignment
+
+Calculates quality of multiple alignment given a .sam
+or .bam alignment and the reference sequence.
+
+Chris Brumbaugh, cbrumbau@soe.ucsc.edu, 06/14/2013
+"""
+
+import sys, argparse
+from Bio import SeqIO
+sys.path.append('/projects/compbio/lib/python2.7/site-packages')
+import pysam
+
+# Command line arguments: positional input file, - is stdin, optional unmapped reads file, weights for scoring
+
+parser = argparse.ArgumentParser()
+parser.add_argument("alignment", action="store", default="-", help="sam or bam file containing multiple alignment to be analyzed")
+parser.add_argument("-u", "--unmapped", action="store", help="unmapped reads from the multiple alignment in fasta format")
+parser.add_argument("-s", "--substitution", action="store", type=float, default="1", help="weight given to substitutions in the alignment")
+parser.add_argument("-i", "--insertion", action="store", type=float, default="1", help="weight given to insertions in the alignment")
+parser.add_argument("-d", "--deletion", action="store", type=float, default="1", help="weight given to deletions in the alignment")
+
+args = parser.parse_args()
+
+# Read in sam/bam file, unmapped if provided
+
+if args.alignment == "-":
+	# Read the .sam/.bam file from stdin
+	sam_file = pysam.Samfile(sys.stdin, 'rb')
+elif ".bam" in args.alignment.lower():
+	sam_file = pysam.Samfile(args.alignment, 'rb')
+elif ".sam" in args.alignment.lower():
+	sam_file = pysam.Samfile(args.alignment, 'r') 
+
+# Parse file and generate statistics about file
+
+bases_aligned = 0	# qlen
+substitutions = 0	# cigar 8
+insertions = 0		# cigar 1
+deletions = 0		# cigar 2
+soft_clip = 0		# cigar 4
+hard_clip = 0		# cigar 5
+unmapped = 0
+
+for read in sam_file.fetch():
+	bases_aligned += read.qlen
+	for (cigar_op, cigar_len) in read.cigar:
+		if cigar_op == 8:
+			substitutions += cigar_len
+		elif cigar_op == 1:
+			insertions += cigar_len
+		elif cigar_op == 2:
+			deletions += cigar_len
+		elif cigar_op == 4:
+			soft_clip += cigar_len
+		elif cigar_op == 5:
+			hard_clip += cigar_len
+
+sam_file.close()
+
+if args.unmapped:
+	for record in SeqIO.parse(open(args.unmapped, 'r'), 'fasta'):
+		unmapped += len(record.seq)
+
+# generate weighted score (include unmapped reads if provided) and print to stdout
+
+weighted_score = bases_aligned - (args.substitution * substitutions + args.insertion * insertions + args.deletion * deletions + soft_clip + hard_clip + unmapped)
+
+print weighted_score
+
+sys.exit(0)

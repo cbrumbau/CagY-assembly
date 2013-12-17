@@ -1,0 +1,78 @@
+#!/usr/bin/env python2.7
+"""
+generate-sam-header
+
+Generates sam header given the format version and other header lines and required fields.
+Does not validate input for fields, use at own risk.
+
+Chris Brumbaugh, cbrumbau@soe.ucsc.edu, 09/27/2013
+"""
+
+import sys, argparse, random
+from Bio import SeqIO
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--HD_VN", required=True,
+	help="""The format version of the .sam file.""")
+parser.add_argument("--HD_optional",
+	help="""Comma delimited string of optional @HD fields and
+values.""")
+parser.add_argument("--SQ_SN", required=True,
+	help="""Reference sequence name.""")
+parser.add_argument("--SQ_LN_file", required=True,
+	help="""FASTA file to determine reference sequence length.""")
+parser.add_argument("--SQ_optional",
+	 help="""Comma delimited string of optional @SQ fields and
+values.""")
+parser.add_argument("--RG_ID", default=None,
+	help="""Read group identifier. If this option is not
+specified, a unique read group identifier is automatically
+generated.""")
+parser.add_argument("--RG_optional",
+	help="""Comma delimited string of optional @RG fields and
+values.""")
+parser.add_argument("--PG_ID", required=True,
+	help="""Program record identifier.""")
+parser.add_argument("--PG_optional",
+	help="""Comma delimited string of optional @PG fields and
+values.""")
+parser.add_argument("--CO", default=None,
+	help="""One line text comment.""")
+parser.add_argument("-e", "--regexp", action="store_true",
+	help="""Format output for regular expression.""")
+#parser.add_argument("-o", "--output", default=None,
+#	help="""File to write the .sam header.
+#Default = stdout""")
+
+args = parser.parse_args()
+
+# Generate .sam header
+newline = pgnewline = conewline = "\n"
+if args.regexp:
+	newline = "\\n"
+	if args.CO:
+		conewline = ""
+	else:
+		pgnewline = ""
+length = str(len(SeqIO.read(args.SQ_LN_file, "fasta")))
+formatted_HD_optional = formatted_SQ_optional = formatted_RG_optional = formatted_PG_optional = list()
+if args.HD_optional:
+	formatted_HD_optional = [a for b in [value_pair.split("=") for value_pair in args.HD_optional.split(",")] for a in b]
+if args.SQ_optional:
+	formatted_SQ_optional = [a for b in [value_pair.split("=") for value_pair in args.SQ_optional.split(",")] for a in b]
+if args.RG_optional:
+	formatted_RG_optional = [a for b in [value_pair.split("=") for value_pair in args.RG_optional.split(",")] for a in b]
+if args.PG_optional:
+	formatted_PG_optional = [a for b in [value_pair.split("=") for value_pair in args.PG_optional.split(",")] for a in b]
+if not args.RG_ID:
+	# Generate an id
+	random.seed()
+	args.RG_ID = str(random.randint(10000, 99999))
+sys.stdout.write("\t".join(["@HD", "VN", args.HD_VN] + formatted_HD_optional) + newline)
+sys.stdout.write("\t".join(["@SQ", "SN", args.SQ_SN, "LN", length] + formatted_SQ_optional) + newline)
+sys.stdout.write("\t".join(["@RG", "ID", args.RG_ID] + formatted_RG_optional) + newline)
+sys.stdout.write("\t".join(["@PG", "ID", args.PG_ID] + formatted_PG_optional) + pgnewline)
+if args.CO:
+	sys.stdout.write("@CO " + args.CO + conewline)
+
+sys.exit(0)

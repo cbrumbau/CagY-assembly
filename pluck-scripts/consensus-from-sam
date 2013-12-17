@@ -1,0 +1,159 @@
+#!/usr/bin/env python2.7
+"""
+consensus-from-sam
+
+Generates consensus sequence given a .sam or .bam alignment and the reference sequence.
+
+Chris Brumbaugh, cbrumbau@soe.ucsc.edu, 06/21/2013
+"""
+
+import sys, argparse, itertools, random
+from Bio import SeqIO
+sys.path.append('/projects/compbio/lib/python2.7/site-packages')
+import pysam
+
+import fasta
+
+# Command line arguments: sam or bam input file (- indicates read .bam from STDIN), reference fasta file, insert choice, and the end length for beginning/end inserts
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("-a", "--alignment", required=True,
+	help="""The .sam or .bam alignment to use to generate the new
+consensus sequence from (- reads .bam from STDIN).""")
+parser.add_argument("-r", "--reference", required=True,
+	help="""The reference fasta file for the provided alignment.""")
+parser.add_argument("--insert", choices=['all', 'no', 'b', 'e', 'be'], default="no",
+    	help="""add the longest inserts to the consensus.
+  no	don't add inserts
+  all	add inserts wherever they occur
+  b	only add one insert near the beginning
+  e	only add one insert near the end
+  be	only add one insert near the beginning and one near the end
+The --inserts option can be modified by --end_length.""")
+parser.add_argument("--end_length", type=int, default=30,
+	help="""Only add an insert if it is within end_length of one
+of the ends.""")
+parser.add_argument("--min_prob", type=float,
+	help="""Discard match columns where the most probable base
+has a probability less than this.""")
+parser.add_argument("--min_coverage", type=int,
+	help="""Discard match columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--name", default=None,
+	help="""Name for the new consensus sequence. Default is the
+fasta description for the reference sequence.""")
+
+args = parser.parse_args()
+
+# Set filehandle for alignment appropriately
+if args.alignment == "-":
+	# Read the .bam file from STDIN
+	sam_file = pysam.Samfile(sys.stdin, 'rb')
+elif ".bam" in args.alignment.lower():
+	# Read in .bam file
+	sam_file = pysam.Samfile(args.alignment, 'rb')
+elif ".sam" in args.alignment.lower():
+	# Read in .sam file
+	sam_file = pysam.Samfile(args.alignment, 'r') 
+
+reference = SeqIO.read(open(args.reference, 'r'), 'fasta')
+
+if args.name is None:
+	# Set name (by default) to reference description
+	args.name = reference.description
+
+def apply_match(match_dict, ref_base, min_coverage=0, min_prob=0.0):
+	# Check if match_dict is empty
+	if match_dict == {}:
+		return ref_base
+	# Check for min coverage
+	if sum(match_dict.values()) < min_coverage:
+		return ref_base
+	# Check for min prob
+	if (float(max(match_dict.values())) / float(sum(match_dict.values()))) < min_prob:
+		return ref_base
+	# Apply best alignment match
+	max_count = max(match_dict.values())
+	match_bases = []
+	for (base, count) in match_dict.iteritems():
+		if count == max_count:
+			match_bases.append(base)
+	# Return one of the best match(es)
+	if len(match_bases) == 1:
+		# Only one best match, return base
+		return match_bases[0]
+	else:
+		# Select one of best match bases at random
+		random.seed()
+		return match_bases[random.randint(0, len(match_bases)-1)]
+
+longest_insert = [""]*len(reference.seq) # list of longest insert at a given position
+match_count = [{} for i in range(len(reference.seq))] # list of dicts containing match counts at a given position
+
+# Read in .sam/.bam alignment file and store alignment matches and longest inserts
+for align in sam_file.fetch():
+	# Parse the CIGAR string
+	cigar_pos = 0	
+	ref_pos = 0
+	for (cigar_op, cigar_len) in align.cigar:
+		# Add matches to dict, using offset in position (0 based in pysam, 1 based in CIGAR format)
+		if cigar_op == 0: # alignment match
+			# Process all matches for length indicated by CIGAR
+			for match_pos in range(0, cigar_len):
+				current_pos = align.pos + ref_pos + match_pos
+				# Get the actual alignment match from the sequence
+				align_match = align.seq[cigar_pos + match_pos]
+				try:
+					# Increment current match counter
+					match_count[current_pos][align_match] += 1
+				except:
+					# Add new match to current dict
+					match_count[current_pos][align_match] = 1
+			ref_pos += cigar_len
+			# align match + insertion + soft clip + seq match + seq mismatch = seq length
+			cigar_pos += cigar_len
+		# Get all the inserts in the current alignment
+		elif cigar_op == 1: # insertion to reference
+			# Process insertion and length at indicated position
+			insert_match = align.seq[cigar_pos:(cigar_pos + cigar_len)]
+			current_pos = align.pos + ref_pos
+			# Compare if current insert is longest
+			if len(longest_insert[current_pos]) < len(insert_match):
+				longest_insert[current_pos] = insert_match
+			# align match + insertion + soft clip + seq match + seq mismatch = seq length
+			cigar_pos += cigar_len
+		elif cigar_op in [2, 3, 6]: # [deletion, skipped region, padding (silent deletion)]
+			ref_pos += cigar_len
+		elif cigar_op in [4, 7, 8]: # [soft clip, seq match, seq mismatch]
+			ref_pos += cigar_len
+			# align match + insertion + soft clip + seq match + seq mismatch = seq length
+			cigar_pos += cigar_len
+
+# Prepare specified inserts to sequence
+longest_insert_before = [""]*len(reference.seq) # initialize list with inserts to use with consensus
+
+if args.insert == "all":
+	longest_insert_before = longest_insert
+#	for (index, insert) in enumerate(longest_insert_before):
+#		if index == 1 and len(longest_insert[0]) > 0:
+#			longest_insert_before[index] = sorted(longest_insert[0], key=len, reverse=True)[0]
+#		if index > 1:
+#			longest_insert_before[index] = sorted(longest_insert[:index-1], key=len, reverse=True)[0]
+else:
+	if "b" in args.insert:
+		(index_b, insert_b) = sorted([(key, value) for (key, value) in enumerate(longest_insert)][:args.end_length], key=lambda seq: len(seq[1]), reverse=True)[0]
+		longest_insert_before[index_b] = insert_b
+	if "e" in args.insert:
+		(index_e, insert_e) = sorted([(key, value) for (key, value) in enumerate(longest_insert)][args.end_length+1:], key=lambda seq: len(seq[1]), reverse=True)[0]
+		longest_insert_before[index_e] = insert_e
+
+# Generate consensus sequence from data
+consensus_list = [apply_match(match_dict, reference.seq[index], min_coverage=args.min_coverage, min_prob=args.min_prob) for (index, match_dict) in enumerate(match_count)]
+
+# Add inserts to consensus sequence, generate new consensus sequence
+new_consensus = "".join([item for items in itertools.izip_longest(longest_insert_before, consensus_list, fillvalue="") for item in items]) 
+
+# Print new consensus sequence as fasta to STDOUT
+fasta.print_sequence(sys.stdout, args.name, "", new_consensus, line_len=100, block_len=100)
+
+sys.exit(0)

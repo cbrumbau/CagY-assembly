@@ -1,0 +1,802 @@
+#!/usr/bin/env python2.7
+"""
+training-and-consensus-from-sam
+
+Reads in intial .sam alignment against all reads.
+Selects reads to use for training and final alignment.
+Trains reference sequence using reads selected from the initial .sam alignment.
+Continues until it converges or hits iteration hard limit.
+Aligns trained sequence to the selection for alignment and applies matches only.
+Prints final consensus sequence to STDOUT.
+
+Chris Brumbaugh, cbrumbau@soe.ucsc.edu, 07/10/2013
+"""
+
+import sys, argparse, itertools, logging, math, os, pprint, random, re, subprocess
+
+import numpy
+from Bio import SeqIO
+sys.path.append('/projects/compbio/lib/python2.7/site-packages')
+import pysam
+
+import fasta
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+parser.add_argument("--alignment", required=True,
+	help="""The .sam or .bam alignment produced by applying all the
+reads against the previous iteration consensus sequence.""")
+parser.add_argument("--reference", required=True,
+	help="""The reference consensus sequence used to 
+generate the alignment.""")
+parser.add_argument("--reads", required=True,
+	help="""All the reads used to produce the alignment.""")
+parser.add_argument("--num_train_reads", required=True, type=int,
+	help="""The number of reads to be used for training.""")
+parser.add_argument("--num_align_reads", required=True, type=int,
+	help="""The number of reads to be used for aligning.""")
+parser.add_argument("--num_train_reads_ends", type=int,
+	help="""The number of reads at ends to be used for training.
+Requires --dont_bin_reads to function.""")
+parser.add_argument("--num_align_reads_ends", type=int,
+	help="""The number of reads at ends to be used for aligning.
+Requires --dont_bin_reads to function.""")
+parser.add_argument("--limit", type=int, default=10,
+	help="""The number of iterations to stop at if the training
+does not converge on a consensus sequence.""")
+parser.add_argument("--parallel", type=int, default=1,
+	help="""The number of processors to use when using
+blasr to generate the multiple sequence alignments.""")
+parser.add_argument("--extend", action="store_true",
+	help="""Apply extensions from reads at the beginning and
+end of the sequence to extend the consensus sequence.""")
+parser.add_argument("--end_length", type=int, default=30,
+	help="""Finds extensions from alignments up to
+end_length bases into the reference sequence.
+Requires --extend to function.""")
+parser.add_argument("--min_prob", type=float, default=0.5,
+	help="""Discard match columns where the most probable base
+has a probability less than this.""")
+parser.add_argument("--min_coverage", type=int, default=0,
+	help="""Discard match columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--min_prob_ins", type=float, default=0.5,
+	help="""Discard insert columns where the most probable base
+has a probability less than this.""")
+parser.add_argument("--min_coverage_ins", type=int, default=0,
+	help="""Discard insert columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--min_prob_del", type=float, default=0.5,
+	help="""Discard delete columns where the most probable
+delete has a probability less than this.""")
+parser.add_argument("--min_coverage_del", type=int, default=0,
+	help="""Discard delete columns with fewer than this many
+sequences having an alignment match at that column.""")
+parser.add_argument("--name", default=None,
+	help="""Name for the new consensus sequence. Default is the
+fasta description for the reference sequence.""")
+parser.add_argument("--rle", action="store_true",
+	help="""Apply run length encoding to the model surgery to
+mitigate homopolymer errors.""")
+parser.add_argument("--use_evalue", action="store_true",
+	help="""Uses e-values in a .sam or .bam alignment derived
+from blast results stored in the string formatted
+optional field 'XV' over the alignment score in
+optional field 'AS'.
+Overrides --sort_score to 'asc'.""")
+parser.add_argument("--sort_score", choices=["asc", "desc"],
+default="desc",
+	help="""Selects the sort type to be used on the alignment
+scores when selecting the inital training and
+aligning read sets.
+Default: desc""")
+parser.add_argument("--random_reads", action="store_true",
+	help="""Randomly select the reads in each bin during read
+selection, otherwise selects the best scoring
+alignment in each bin.""")
+parser.add_argument("--dont_bin_reads", action="store_true",
+	help="""Don't evenly bin the reads across the reference
+and instead select the best reads, with extra
+reads within end length of the ends.""")
+parser.add_argument("-z", "--gzip", action="store_true",
+	help="""Gzip the reads selected for training and aligning.""")
+parser.add_argument("-v", "--verbose", action="store_true",
+	help="""Print verbose messages.""")
+
+args = parser.parse_args()
+
+pp = pprint.PrettyPrinter(indent = 4)
+
+if args.verbose:
+	logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.DEBUG)
+
+# Set filehandle for alignment appropriately
+reference_fasta = SeqIO.read(open(args.reference, 'r'), 'fasta')
+reference = str(reference_fasta.seq)
+
+if args.name is None:
+	# Set name (by default) to reference description
+	args.name = reference_fasta.description
+
+def orient_read(seqio_record, is_reverse_set):
+	"""Returns the oriented SeqIO record if in the
+	is_reverse set."""
+	if seqio_record.description in is_reverse_set:
+		# Return reverse complement
+		seqio_record.seq = seqio_record.seq.reverse_complement()
+		return seqio_record
+	else:
+		return seqio_record
+
+def RLElen(list):
+	"""Returns the length as a string if the length is
+	greater than 1, else returns an empty string."""
+	if len(list) > 1:
+		return str(len(list))
+	else:
+		return ''
+
+def RLE(seq, act):
+	"""Encodes or decodes sequence in run length encoding.
+	Returns an tuple with (RLE list, map list, reverse map list) for encode.
+	Returns a list with the decoded RLE for decode.
+	Returns None if not encode or decode."""
+	if act == "encode":
+		rlelist = [(RLElen(list(g)), k) for (k, g) in itertools.groupby(seq)]
+		map = [i for i in range(len(seq))]
+		reverse_map = [i for i in range(len(rlelist))]
+		map_index = 0
+		for (index, (length, base)) in enumerate(rlelist):
+			if length == '':
+				length = 1
+			reverse_map[index] = []
+			for pos in range(int(length)):
+				reverse_map[index].append(map_index)
+				map[map_index] = index
+				map_index += 1
+		return (rlelist, map, reverse_map)
+	elif act == "decode":
+		rlelist = []
+		prevint = ''
+		for c in seq:
+			if prevint.isdigit():
+				rlelist.append(int(prevint) * c)
+				prevint = ''
+			elif c.isdigit():
+				prevint = c
+			else:
+				rlelist.append(c)
+				prevint = ''
+		return rlelist
+	else:
+		return None
+
+def apply_delete_match_insert(ref_base_list, match_dict_list, insert_dict_list, delete_dict_list, rle_base_tuple, rle_match_align_set, rle_insert_align_set, rle_delete_align_set, min_coverage=0, min_prob=0.0, min_coverage_ins=0, min_prob_ins=0.0, min_coverage_del=0, min_prob_del=0.0):
+	"""Applies matches, insertions, and deletions to the given reference
+	with the provided match, insert, and delete dictionaries."""
+	return_dict = {"match": None, "insert": None, "delete": None}
+	# Condense information to RLE
+	match_dict = dict()
+	insert_dict = dict()
+	delete_dict = dict()
+	for i in range(len(ref_base_list)):
+		for (key, value) in match_dict_list[i].iteritems():
+			try:
+				match_dict[key] += value
+			except:
+				match_dict[key] = value
+		for (key, value) in insert_dict_list[i].iteritems():
+			try:
+				if key == "noinsert":
+					insert_dict[key] += value
+				elif key == "insert":
+					insert_dict[key].extend(value)
+			except:
+				if key == "noinsert":
+					insert_dict[key] = value
+				elif key == "insert":
+					insert_dict[key] = value
+		for (key, value) in delete_dict_list[i].iteritems():
+			try:
+				delete_dict[key] += value
+			except:
+				delete_dict[key] = value
+	# Apply delete is above min_coverage and min_prob
+	if delete_dict["nodelete"] != 0:
+		if delete_dict["delete"] > min_coverage_del:
+			if (float(delete_dict["delete"]) / float(delete_dict["delete"] + delete_dict["nodelete"])) > min_prob_del:
+				if rle_base_tuple[0] == '':
+					return_dict["delete"] = ('', '')
+				else:
+					if int(rle_base_tuple[0]) > 1:
+						expected_del_len = float(delete_dict["delete"])/float(len(rle_delete_align_set))
+						#logging.info("Expected delete length: " + str(int(round(expected_del_len))))
+						if round(expected_del_len) < 1.0:
+							return_dict["delete"] = None
+						else:
+							# Apply delete length to reference
+							new_len = float(int(rle_base_tuple[0])) - expected_del_len
+							if int(round(new_len)) == 1:
+								new_len = ''
+							else:
+								new_len = int(round(new_len))
+							return_dict["delete"] = (str(new_len), rle_base_tuple[1])
+	# Apply match if no deletion
+	if return_dict["delete"] == None:
+		# Check if match_dict is empty
+		if match_dict == {}:
+			return_dict["match"] = rle_base_tuple
+		else:
+			# Check for min coverage
+			if sum(match_dict.values()) < min_coverage:
+				return_dict["match"] = rle_base_tuple
+			else:
+				# Check for min prob
+				if (float(max(match_dict.values())) / float(sum(match_dict.values()))) < min_prob:
+					return_dict["match"] = rle_base_tuple
+				else:
+					# Apply best alignment match
+					max_count = max(match_dict.values())
+					match_bases = []
+					for (base, count) in match_dict.iteritems():
+						if count == max_count:
+							match_bases.append(base)
+					# Return one of the best match(es), if not deletion
+					if return_dict["match"] == None:
+						if rle_base_tuple[0] != '':
+							# Calculate expected length of homopolymer run
+							expected_match_len = float(match_dict[match_bases[0]])/float(len(rle_match_align_set))
+							#if int(rle_base_tuple[0]) != int(round(expected_match_len)):
+							#	logging.info("Current ref length: " + str(int(float(rle_base_tuple[0]))) + ", expected match length: " + str(int(round(expected_match_len))))
+							if round(expected_match_len) < 1.0:
+								return_dict["match"] = rle_base_tuple
+							else:
+								if int(round(expected_match_len)) == 1:
+									expected_match_len = ''
+								else:
+									expected_match_len = int(round(expected_match_len))
+								if len(match_bases) == 1:
+									return_dict["match"] = (str(expected_match_len), match_bases[0])
+								else:
+									# Prioritize best match base that matches rle reference, else random
+									if rle_base_tuple[1] in match_bases:
+										return_dict["match"] = (str(expected_match_len), rle_base_tuple[1])
+									else:
+										random.seed()
+										return_dict["match"] = (str(expected_match_len), match_bases[random.randint(0, len(match_bases)-1)])
+						else:
+							if len(match_bases) == 1:
+								# Only one best match, return base
+								return_dict["match"] =  ('', match_bases[0])
+							else:
+								# Prioritize best match base that matches rle reference, else random
+								if rle_base_tuple[1] in match_bases:
+									return_dict["match"] = ('', rle_base_tuple[1])
+								else:
+									random.seed()
+									return_dict["match"] = ('', match_bases[random.randint(0, len(match_bases)-1)])
+	#if rle_base_tuple[0] != '':
+	#	if return_dict["delete"] == None and return_dict["match"] == None:
+	#		logging.info("Delete and match are both None for homopolymer length > 1")
+	# Apply insertions inside homopolymer and between homopolymers of deletion or match
+	# Check if insert dict has inserts
+	if (len(insert_dict["insert"]) + insert_dict["noinsert"]) == 0:
+		return_dict["insert"] = ('', '', 0)
+	else:
+		# Check for min coverage
+		if len(insert_dict["insert"]) < min_coverage:
+			return_dict["insert"] = ('', '', 0)
+		else:
+			# Check for min prob of insert
+			if (float(len(insert_dict["insert"])) / float(insert_dict["noinsert"])) < min_prob:
+				return_dict["insert"] = ('', '', 0)
+			else:
+				# Check for min prob of best insert
+				freq = dict()
+				for insert in insert_dict["insert"]:
+					try:
+						freq[insert[0]] += 1
+					except:
+						freq[insert[0]] = 1
+				(best_insert, max_count) = sorted([(key, value) for (key, value) in freq.iteritems()], key=lambda ins: ins[1], reverse=True)[0]
+				total = sum([value for value in freq.itervalues()])
+				if (float(max_count) / float(total)) < min_prob:
+					return_dict["insert"] = ('', '', 0)
+				else:
+					# Apply best insert to deletion or match
+					if return_dict["insert"] == None:
+						if return_dict["delete"] == None:
+							if return_dict["match"][0] == '':
+								new_len = 1
+							else:
+								new_len = int(return_dict["match"][0])
+						elif return_dict["match"] == None:
+							if return_dict["delete"][0] == '':
+								new_len = 1
+							else:
+								new_len = int(return_dict["delete"][0])
+						if rle_base_tuple[0] == '':
+							old_len = 1
+						else:
+							old_len = int(rle_base_tuple[0])
+						if old_len == new_len == 1:
+							# Not homopolymer unit
+							return_dict["insert"] = ('', best_insert, 1)
+						else:
+							# Check to see if most probable insert has expected value >= 1.0
+							expected_ins_len = float(max_count)/float(len(rle_insert_align_set))
+							if expected_ins_len >= 1.0:
+								# Then determine most probable insert location
+								max_prob = 0.0
+								max_prob_pos = 0
+								for (index, insert_dict) in enumerate(insert_dict_list):
+									try:
+										this_prob = float(insert_dict[best_insert])/float(insert_dict["noinsert"])
+									except:
+										this_prob = 0.0
+									if this_prob > max_prob:
+										max_prob = this_prob
+										max_prob_pos = index + 1
+								# And apply to delete/match of new length
+								diff = new_len - old_len
+								new_pos = max_prob_pos + diff
+								if new_pos < 0:
+									new_pos = 0
+								return_dict["insert"] = ('', best_insert, new_pos)
+							else:
+								return_dict["insert"] = ('', '', 0)
+	# Return completed list with deletions, matches, insertions
+	return_list = list()
+	if return_dict["delete"] == None:
+		return_list.append(return_dict["match"])
+	elif return_dict["match"] == None:
+		return_list.append(return_dict["delete"])
+	# Apply insertion to return list
+	return_value = return_list.pop(0)
+	insert_tuple = (return_dict["insert"][0], return_dict["insert"][1])
+	base_str = "".join(RLE("".join([a+b for (a, b) in [return_value]]), "decode"))
+	insert_str = "".join(RLE("".join([a+b for (a, b) in [insert_tuple]]), "decode"))
+	# Add insert to insert position
+	pos = return_dict["insert"][2]
+	modified_str = base_str[:pos] + insert_str + base_str[pos:]
+	# Reencode new string, add to return list
+	new_rle_list = RLE(modified_str, "encode")[0]
+	return_list.extend(new_rle_list)
+	# Return modified return list
+	return return_list
+
+def apply_match_extend(ref_base_list, match_dict_list, rle_base_tuple, rle_match_align_set, min_coverage=0, min_prob=0.0, extend=''):
+	"""Applies matches to the given reference with
+	the provided match dictionary."""
+	# Condense information to RLE
+	match_dict = dict()
+	for i in range(len(ref_base_list)):
+		for (key, value) in match_dict_list[i].iteritems():
+			try:
+				match_dict[key] += value
+			except:
+				match_dict[key] = value
+	# Check if match_dict is empty
+	if match_dict == {}:
+		return [rle_base_tuple, ('', extend)]
+	# Check for min coverage
+	if sum(match_dict.values()) < min_coverage:
+		return [rle_base_tuple, ('', extend)]
+	# Check for min prob
+	if (float(max(match_dict.values())) / float(sum(match_dict.values()))) < min_prob:
+		return [rle_base_tuple, ('', extend)]
+	# Apply best alignment match
+	max_count = max(match_dict.values())
+	match_bases = []
+	for (base, count) in match_dict.iteritems():
+		if count == max_count:
+			match_bases.append(base)
+	# Return one of the best match(es)
+	if rle_base_tuple[0] != '':
+		# Calculate expected length of homopolymer run
+		expected_match_len = float(match_dict[match_bases[0]])/float(len(rle_match_align_set))
+		if round(expected_match_len) < 1.0:
+			return [rle_base_tuple, ('', extend)]
+		else:
+			if int(round(expected_match_len)) == 1:
+				expected_match_len = ''
+			else:
+				expected_match_len = int(round(expected_match_len))
+			if len(match_bases) == 1:
+				return [(str(expected_match_len), match_bases[0]), ('', extend)]
+			else:
+				# Prioritize best match base that matches rle reference, else random
+				if rle_base_tuple[1] in match_bases:
+					return [(str(expected_match_len), rle_base_tuple[1]), ('', extend)]
+				else:
+					random.seed()
+					return [(str(expected_match_len), match_bases[random.randint(0, len(match_bases)-1)]), ('', extend)]
+	else:
+		if len(match_bases) == 1:
+			# Only one best match, return base
+			return [('', match_bases[0]), ('', extend)]
+		else:
+			# Prioritize best match base that matches rle reference, else random
+			if rle_base_tuple[1] in match_bases:
+				return [('', rle_base_tuple[1]), ('', extend)]
+			else:
+				random.seed()
+				return [('', match_bases[random.randint(0, len(match_bases)-1)]), ('', extend)]
+
+def find_extend(insert_dict_list, reverse_map, rle_start, rle_end):
+	"""Finds the longest insert in the provided lists and
+	returns the insert extension with the rle index it is
+	located at."""
+	# Failsafe for rle_start, rle_end out of bounds
+	if rle_start < 0:
+		rle_start = 0
+	if rle_end > (len(reverse_map)-1):
+		rle_end = len(reverse_map)-1
+	# Intialize longest inserts
+	longest_insert = ''
+	longest_insert_rle_index = None
+	for rle_index in range(rle_start, rle_end):
+		# Identify longest insert and compare to longest recorded insert
+		#insert_dict_list_subset = insert_dict_list[reverse_map[rle_index][0]:reverse_map[rle_index][-1]+1]
+		#all_inserts = list()
+		#for insert_dict in insert_dict_list_subset:
+		#	all_inserts.extend(insert_dict["insert"])
+		# Try only end inserts
+		all_inserts = insert_dict_list[reverse_map[rle_index][-1]]["insert"]
+		try:
+			this_longest_insert = sorted(all_inserts, key=lambda seq: len(seq), reverse=True)[0]
+		except:
+			this_longest_insert = ''
+		if len(this_longest_insert) > len(longest_insert):
+			longest_insert = this_longest_insert
+			longest_insert_rle_index = rle_index
+	if longest_insert == '':
+		return (None, None)
+	else:
+		return (longest_insert, longest_insert_rle_index)
+
+def train_consensus(iter_limit, reference, reads, min_coverage, min_prob, min_coverage_ins, min_prob_ins, min_coverage_del, min_prob_del, align_file=None, match_only=False, extend_match_only=False, end_length=0, rle=False):
+	"""Trains the reference sequence on the reads for
+	the provided number of iterations, using model
+	surgery applying matches, insertions, and deletions
+	to the reference sequence."""
+	#previous_consensus = list()
+	# Iterate training consensus sequence until convergence or limit
+	for iter in range(0, iter_limit):
+		logging.info("Starting iteration " + str(iter+1) + ".")
+		logging.info("Consensus length before: " + str(len(reference)))
+		if align_file is None:
+			# Generate .sam alignment using blasr
+			consensus_file = open(args.reference + ".tmp.fasta", "w")
+			consensus_file.write(">iter" + str(iter) + "\n" + reference)
+			consensus_file.close()
+			#logging.info("Running blasr on consensus sequence...")
+			subprocess.call(["/projects/compbio/bin/x86_64/blasr", reads, args.reference + ".tmp.fasta", "-nproc", str(args.parallel), "-sam", "-out", args.reference + ".tmp.sam"])
+			# Open .sam and prepare to parse
+			sam_file = pysam.Samfile(args.reference + ".tmp.sam", 'r')
+		else:
+			sam_file = pysam.Samfile(align_file, 'r')
+		# Generate reference list and map to the reference list
+		if rle:
+			(rle_list, map, reverse_map) = RLE(reference, "encode")
+		else:
+			rle_list = [('', base) for base in list(reference)] # 1 to 1 rle list
+			map = [i for i in range(len(reference))] # 1 to 1 map
+			reverse_map = [[i] for i in range(len(reference))] # 1 to 1 reverse map
+		rle_match_align_count = [set() for i in range(len(rle_list))] # list of sets of alignments seen at match position in rle
+		rle_insert_align_count = [set() for i in range(len(rle_list))] # list of sets of alignments seen at insert position in rle
+		rle_delete_align_count = [set() for i in range(len(rle_list))] # list of sets of alignments seen at delete position in rle
+		match_count = [{} for i in range(len(reference))] # list of dicts containing match counts
+		insert_count = [{"insert": list(), "noinsert": 0} for i in range(len(reference))] # list of dicts containing insert counts
+		delete_count = [{"delete": 0, "nodelete": 0} for i in range(len(reference))] # list of dicts containing deletion counts
+		#logging.info("Parsing CIGAR strings in alignment...")
+		# Read in alignment file and store alignment matches
+		for align in sam_file.fetch():
+			# Parse the CIGAR string
+			cigar_pos = 0
+			ref_pos = 0
+			this_align = align
+			for (cigar_op, cigar_len) in align.cigar:
+				# Add matches to dict, using offset in position (0 based in pysam, 1 based in CIGAR format)
+				if cigar_op == 0: # alignment match
+					# Process all matches for length indicated by CIGAR
+					for match_pos in range(0, cigar_len):
+						current_pos = align.pos + ref_pos + match_pos
+						# Get the actual alignment match from the sequence
+						align_match = align.seq[cigar_pos + match_pos]
+						try:
+							# Increment current match counter
+							match_count[current_pos][align_match] += 1
+						except:
+							# Add new match to current dict
+							match_count[current_pos][align_match] = 1
+						insert_count[current_pos]["noinsert"] += 1
+						delete_count[current_pos]["nodelete"] += 1
+						if this_align not in rle_match_align_count[map[current_pos]]:
+							rle_match_align_count[map[current_pos]].add(this_align)
+					ref_pos += cigar_len
+					# align match + insertion + soft clip + seq match + seq mismatch = seq length
+					cigar_pos += cigar_len
+				elif cigar_op == 1: # insertion
+					insert_match = align.seq[cigar_pos:(cigar_pos + cigar_len)]
+					current_pos = align.pos + ref_pos
+					insert_count[current_pos]["insert"].append(insert_match)
+					if this_align not in rle_insert_align_count[map[current_pos]]:
+						rle_insert_align_count[map[current_pos]].add(this_align)
+					# align match + insertion + soft clip + seq match + seq mismatch = seq length
+					cigar_pos += cigar_len
+				elif cigar_op == 2: # deletion
+					for del_pos in range(0, cigar_len):
+						current_pos = align.pos + ref_pos + del_pos
+						delete_count[current_pos]["delete"] += 1
+						if this_align not in rle_delete_align_count[map[current_pos]]:
+							rle_delete_align_count[map[current_pos]].add(this_align)
+					ref_pos += cigar_len
+				elif cigar_op in [3, 6]: # [skipped region, padding (silent deletion)]
+					ref_pos += cigar_len
+				elif cigar_op in [4, 7, 8]: # [soft clip, seq match, seq mismatch]
+					for op_pos in range(0, cigar_len):
+						current_pos = align.pos + ref_pos + op_pos
+						insert_count[current_pos]["noinsert"] += 1
+						delete_count[current_pos]["nodelete"] += 1
+					ref_pos += cigar_len
+					# align match + insertion + soft clip + seq match + seq mismatch = seq length
+					cigar_pos += cigar_len
+		sam_file.close()
+		#logging.info("Preparing matches, insertions, and deletions...")
+		# Generate consensus sequence from data
+		if match_only:
+			consensus_list = list()
+			if extend_match_only:
+				# Find beginning and end extensions to send to apply_match_extend
+				(b_extend, b_rle_index) = find_extend(insert_count, reverse_map, 0, end_length)
+				(e_extend, e_rle_index) = find_extend(insert_count, reverse_map, len(rle_list)-end_length, len(rle_list))
+				if b_rle_index == e_rle_index:
+					# Get rid of one of the extensions, overlap
+					(e_extend, e_rle_index) = (None, None)
+			else:
+				(b_extend, b_rle_index) = (None, None)
+				(e_extend, e_rle_index) = (None, None)
+			for (rle_index, index_list) in enumerate(reverse_map):
+				if rle_index == b_rle_index:
+					rle_apply_list  = apply_match_extend(reference[index_list[0]:index_list[-1]+1], match_count[index_list[0]:index_list[-1]+1], rle_list[rle_index], rle_match_align_count[rle_index], min_coverage=min_coverage, min_prob=min_prob, extend=b_extend)
+				elif rle_index == e_rle_index:
+					rle_apply_list  = apply_match_extend(reference[index_list[0]:index_list[-1]+1], match_count[index_list[0]:index_list[-1]+1], rle_list[rle_index], rle_match_align_count[rle_index], min_coverage=min_coverage, min_prob=min_prob, extend=e_extend)
+				else:
+					rle_apply_list  = apply_match_extend(reference[index_list[0]:index_list[-1]+1], match_count[index_list[0]:index_list[-1]+1], rle_list[rle_index], rle_match_align_count[rle_index], min_coverage=min_coverage, min_prob=min_prob)
+				consensus_list.extend(rle_apply_list)
+		else:
+			consensus_list = list()
+			for (rle_index, index_list) in enumerate(reverse_map):
+				rle_apply_list = apply_delete_match_insert(reference[index_list[0]:index_list[-1]+1], match_count[index_list[0]:index_list[-1]+1], insert_count[index_list[0]:index_list[-1]+1], delete_count[index_list[0]:index_list[-1]+1], rle_list[rle_index], rle_match_align_count[rle_index], rle_insert_align_count[rle_index], rle_delete_align_count[rle_index], min_coverage=min_coverage, min_prob=min_prob, min_coverage_ins=min_coverage_ins, min_prob_ins=min_prob_ins, min_coverage_del=min_coverage_del, min_prob_del=min_prob_del)
+				consensus_list.extend(rle_apply_list)
+		#logging.info("Generating new consensus sequence...")
+		training_consensus = "".join(RLE("".join([a+b for (a, b) in consensus_list]), "decode"))
+		# Compare to previous consensus sequence to check for converegence
+		# Add later
+		#if len(previous_consensus) > 0:
+		# Prepare for next iteration by setting previous_consensus and reference
+		#previous_consensus.append(training_consensus)
+		reference = training_consensus
+		logging.info("Consensus length after: " + str(len(reference)))
+		logging.info("Iteration " + str(iter+1) + " complete.")
+		# Quit iterations if alignment file is present
+		if align_file:
+			break
+	# Clean up temporary files
+	if align_file is None:
+		tmp_files = [args.reference + ".tmp.fasta", args.reference + ".tmp.sam"]
+		for file in tmp_files:
+			os.remove(file)
+	# Return consensus sequence
+	return reference
+
+# Read in .sam alignment, extract evenly distributed reads in alignment
+logging.info("Extracting reads in alignment...")
+if args.alignment == "-":
+	# Read the .bam file from STDIN
+	sam_file = pysam.Samfile(sys.stdin, 'rb')
+elif ".bam" in args.alignment.lower():
+	# Read in .bam file
+	sam_file = pysam.Samfile(args.alignment, 'rb')
+elif ".sam" in args.alignment.lower():
+	# Read in .sam file
+	sam_file = pysam.Samfile(args.alignment, 'r') 
+positions_start = [[] for i in range(len(reference))]
+positions_end = [[] for i in range(len(reference))]
+for align in sam_file.fetch():
+	ref_end = align.aend - 1
+	# Store (read name, alignment score, maps to reverse strand)
+	if use_evalue:
+		try:
+			positions_start[align.pos].append((re.sub(r'\/\d+_\d+$', '', align.qname), float(align.opt('XV')), align.is_reverse))
+			positions_end[ref_end].append((re.sub(r'\/\d+_\d+$', '', align.qname), float(align.opt('XV')), align.is_reverse))
+		except:
+			sys.stderr.write("ERROR: No optional field 'XV' for the e-value could be found in the alignment.\n")
+			sam_file.close()
+			sys.exit(1)
+	else:
+		positions_start[align.pos].append((re.sub(r'\/\d+_\d+$', '', align.qname), align.opt('AS'), align.is_reverse))
+		positions_end[ref_end].append((re.sub(r'\/\d+_\d+$', '', align.qname), align.opt('AS'), align.is_reverse))
+sam_file.close()
+if args.random_reads:
+	for index in range(len(reference)):
+		# Remove any bias in alignment order
+		if len(positions_start[index]) > 0:
+			random.shuffle(positions_start[index])
+		if len(positions_end[index]) > 0:
+			random.shuffle(positions_end[index])
+# Reads for train and align
+if str(os.path.split(os.path.splitext(args.reference)[0])[0]) == '':
+	my_sep = ''
+else:
+	my_sep = os.sep
+reads_for_train = os.path.normpath(str(os.path.split(os.path.splitext(args.reference)[0])[0]) + my_sep + "selection_for_train_" +  str(os.path.split(os.path.splitext(args.reference)[0])[1]) + ".fasta")
+reads_for_align = os.path.normpath(str(os.path.split(os.path.splitext(args.reference)[0])[0]) + my_sep + "selection_for_align_" +  str(os.path.split(os.path.splitext(args.reference)[0])[1]) + ".fasta")
+for read_select in ["train", "align"]:
+        if read_select == "train":
+		logging.info("Selecting reads for training...")
+		logging.info(str(args.num_train_reads) + " requested reads for training.")
+		num_reads = args.num_train_reads
+		if args.dont_bin_reads:
+			num_reads_ends = args.num_train_reads_ends
+	if read_select == "align":
+		logging.info("Selecting reads for aligning...")
+		logging.info(str(args.num_align_reads) + " requested reads for aligning.")
+		num_reads = args.num_align_reads
+		if args.dont_bin_reads:
+			num_reads_ends = args.num_align_reads_ends
+	select_reads = set()
+	is_reverse = set()
+	# Failsafe for more reads than available
+	all_reads = set([(list(a)[0], list(a)[2]) for b in positions_start for a in b])
+	if len(all_reads) <= num_reads:
+		for (read, is_reverse_flag) in all_reads:
+			if is_reverse_flag:
+				is_reverse.add(read)
+			select_reads.add(read)
+		num_reads = len(all_reads)
+	# Set sort type for scores
+	if use_evalue:
+		sort_reverse = False
+	else:
+		if sort_score == "asc":
+			sort_reverse = False
+		elif sort_score == "desc":
+			sort_reverse = True 
+	# Take top reads and extra at ends if no bins requested
+	if args.dont_bin_reads:
+		all_align_sorted = sorted([a for b in positions_start for a in b], key=lambda tup: tup[1], reverse=sort_reverse) # flatten and sort alignments
+		# Select top alignments until have enough reads
+		while len(select_reads) < num_reads:
+			try:
+				this_align = all_align_sorted.pop(0)
+				this_read = this_align[0]
+				if this_read not in select_reads:
+					if this_align[2]:
+						is_reverse.add(this_read)
+					select_reads.add(this_read)
+			except:
+				# No more alignments
+				break
+		# Add extra reads at ends in end_length
+		# Eventually add: Run extract-fragments at ends, apply blasr to end fragments
+		# Just use alignments within ends for now for speed
+		select_reads_start = set()
+		select_reads_end = set()
+		start_align_sorted = sorted([a for b in positions_start[0:args.end_length] for a in b], key=lambda tup: tup[1], reverse=sort_reverse)
+		end_align_sorted = sorted([a for b in positions_end[-args.end_length:-1] for a in b], key=lambda tup: tup[1], reverse=sort_reverse)
+		while len(select_reads_start) < num_reads_ends:
+			try:
+				this_align = start_align_sorted.pop(0)
+				this_read = this_align[0]
+				if this_read not in select_reads_start:
+					if this_align[2]:
+						is_reverse.add(this_read)
+					select_reads_start.add(this_read)
+			except:
+				# No more alignments
+				break
+		while len(select_reads_end) < num_reads_ends:
+			try:
+				this_align = end_align_sorted.pop(0)
+				this_read = this_align[0]
+				if this_read not in select_reads_end:
+					if this_align[2]:
+						is_reverse.add(this_read)
+					select_reads_end.add(this_read)
+			except:
+				# No more alignments
+				break
+		# Merge read sets together
+		select_reads = select_reads.union(select_reads_start)
+		select_reads = select_reads.union(select_reads_end)
+	else:
+		# Create number of bins for reads that equals the number of reads requested
+		step = int(float(len(reference))/float(num_reads))
+		if step == 0:
+			# Too many reads requested, set to step size of 1
+			step = 1
+		if step != 1:
+			half_step = int(float(step)/float(2))
+		bins = range(0, step*num_reads, step)
+		if num_reads <= len(reference):
+			bins.append(len(reference))
+		selections = 1 # if no alignments/new reads in bin, increment to pull more from next bin
+		while len(select_reads) < num_reads:
+			# Make multiple passes over reference length if num_reads > len(reference)
+			bin_empty = 0
+			for index in range(num_reads):
+				if step == 1:
+					if index == num_reads - 1:
+						# Last bin was index-1:index, so skip
+						continue
+					# Bin size of 1, just grab alignments starting at index, flatten 2D list
+					this_bin = [a for b in positions_start[bins[index]:bins[index+1]] for a in b]
+				else:
+					# Grab first half from positions_start, second half from positions_end, flatten 2D list
+					#this_bin = [a for b in positions_start[bins[index]:(bins[index]+half_step)] for a in b]
+					#this_bin.extend([a for b in positions_end[(bins[index]+half_step):bins[index+1]] for a in b])
+					# Grab from positions_start and from positions_end, flatten 2D list
+					this_bin = [a for b in positions_start[bins[index]:bins[index+1]] for a in b]
+					this_bin.extend([a for b in positions_end[bins[index]:bins[index+1]] for a in b])
+				if args.random_reads:
+					random.shuffle(this_bin) # flattened into position order, shuffle
+				else:
+					this_bin = sorted(this_bin, key=lambda tup: tup[1], reverse=sort_reverse) # sort by alignment score
+				num_reads_before = len(select_reads)
+				while len(select_reads) < (num_reads_before + selections):
+					try:
+						this_align = this_bin.pop(0)
+						this_read = this_align[0]
+						if this_read not in select_reads:
+							if len(select_reads) < num_reads:
+								if this_align[2]:
+									is_reverse.add(this_read)
+								select_reads.add(this_read)
+					except:
+						# Out of alignments in this_bin
+						bin_empty += 1
+						break
+				num_reads_after = len(select_reads)
+				reads_added = num_reads_after - num_reads_before
+				if step != 1:
+					if reads_added == selections:
+						selections = 1
+					else:
+						selections = 1 + (selections - reads_added)
+			if bin_empty == len(reference):
+				# No more new reads to be added
+				# As a failsafe, this really should never be reached
+				break
+	if read_select == "train":
+		logging.info("Total reads for training: " + str(len(select_reads)))
+		#logging.info("Selected reads for training: " + pp.pformat(select_reads))
+		file_name = reads_for_train
+	if read_select == "align":
+		logging.info("Total reads for aligning: " + str(len(select_reads)))
+		#logging.info("Selected reads for aligning: " + pp.pformat(select_reads))
+		file_name = reads_for_align
+	# Write reads to file
+	logging.info("Writing oriented reads to file...")
+	record_dict = SeqIO.index(args.reads, "fasta")
+	SeqIO.write([orient_read(record_dict[qname], is_reverse) for qname in select_reads], file_name, "fasta")
+
+# Train consensus sequence for requested limit
+logging.info("Calculating " + str(args.limit) + " training iterations...")
+consensus_sequence_trained = train_consensus(args.limit, reference, reads_for_train, args.min_coverage, args.min_prob, args.min_coverage_ins, args.min_prob_ins, args.min_coverage_del, args.min_prob_del, rle=args.rle)
+
+# Align consensus sequence for final iteration
+logging.info("Generating final consensus sequence against align reads...")
+consensus_sequence =  train_consensus(1, consensus_sequence_trained, reads_for_align, args.min_coverage, args.min_prob, args.min_coverage_ins, args.min_prob_ins, args.min_coverage_del, args.min_prob_del, match_only=True, extend_match_only=args.extend, end_length=args.end_length, rle=args.rle)
+
+# Gzip reads files
+if args.gzip:
+	logging.info("Gzipping reads files...")
+	subprocess.call(["gzip", "-f", "-9", reads_for_train]) 
+	subprocess.call(["gzip", "-f", "-9", reads_for_align]) 
+
+# Print trained consensus sequence as fasta to STDOUT
+logging.info("Printing consensus sequence to STDOUT...")
+fasta.print_sequence(sys.stdout, args.name, "", consensus_sequence, line_len=100, block_len=100)
+
+sys.exit(0)
